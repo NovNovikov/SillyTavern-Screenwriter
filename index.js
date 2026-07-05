@@ -3,12 +3,14 @@ import {
     event_types,
     extension_prompt_roles,
     extension_prompt_types,
+    generateRaw,
     generateQuietPrompt,
     itemizedParams,
     itemizedPrompts,
     saveSettingsDebounced,
 } from '../../../../script.js';
 import { extension_settings, getContext } from '../../../extensions.js';
+import { removeReasoningFromString } from '../../../reasoning.js';
 import { debounce } from '../../../utils.js';
 import { getWorldInfoPrompt } from '../../../world-info.js';
 import { getRegexedString, regex_placement } from '../../regex/engine.js';
@@ -105,6 +107,7 @@ const DEFAULT_SETTINGS = {
     recentChatMessages: 30,
     maxGenerationLength: 1000,
     connectionProfile: '',
+    useProfilePromptStack: false,
 };
 
 const DEFAULT_STATE = {
@@ -125,6 +128,10 @@ const runtime = {
     lastError: '',
     lastAutoReplanSignature: '',
     lastSeenChatKey: '',
+    renderVersion: 0,
+    pendingInitialPlanPromptKey: '',
+    pendingInitialPlanPromptTimer: 0,
+    promptRequestVersion: 0,
 };
 
 let initialized = false;
@@ -246,6 +253,57 @@ function getCurrentPlanText() {
 
 function chatHasPlan(state = getChatState()) {
     return Boolean(String(getCurrentPlanText() ?? '').trim() || String(state?.currentPlan ?? '').trim());
+}
+
+function clearPendingInitialPlanPrompt() {
+    if (runtime.pendingInitialPlanPromptTimer) {
+        window.clearTimeout(runtime.pendingInitialPlanPromptTimer);
+        runtime.pendingInitialPlanPromptTimer = 0;
+    }
+}
+
+function scheduleInitialPlanPrompt(chatKey) {
+    clearPendingInitialPlanPrompt();
+    runtime.pendingInitialPlanPromptKey = chatKey;
+    const promptVersion = ++runtime.promptRequestVersion;
+
+    runtime.pendingInitialPlanPromptTimer = window.setTimeout(() => {
+        runtime.pendingInitialPlanPromptTimer = 0;
+
+        if (promptVersion !== runtime.promptRequestVersion) {
+            return;
+        }
+
+        if (!chatKey || runtime.pendingInitialPlanPromptKey !== chatKey || getActiveChatKey() !== chatKey) {
+            return;
+        }
+
+        if (!hasActiveChat() || runtime.isGenerating || !getSettings().enabled) {
+            return;
+        }
+
+        const state = getChatState();
+
+        if (chatHasPlan(state)) {
+            runtime.pendingInitialPlanPromptKey = '';
+            return;
+        }
+
+        const shouldGeneratePlan = window.confirm('Для этого чата у Screenwriter ещё нет плана. Сгенерировать его сейчас?');
+        runtime.pendingInitialPlanPromptKey = '';
+
+        if (!shouldGeneratePlan) {
+            return;
+        }
+
+        window.setTimeout(() => {
+            if (getActiveChatKey() !== chatKey || !hasActiveChat() || runtime.isGenerating) {
+                return;
+            }
+
+            void queueGenerate('chat_entry');
+        }, 0);
+    }, 250);
 }
 
 function checkConnectionProfilesActive() {
@@ -1101,6 +1159,7 @@ function fillFormFromState() {
     panel.querySelector('#stsw-inject-plan').checked = !!settings.injectPlan;
     panel.querySelector('#stsw-include-checkpoint-summaries').checked = !!settings.includeCheckpointSummaries;
     panel.querySelector('#stsw-include-world-info').checked = !!settings.includeWorldInfo;
+    panel.querySelector('#stsw-use-profile-prompt-stack').checked = !!settings.useProfilePromptStack;
     panel.querySelector('#stsw-apply-regex-raw-block').checked = !!settings.applyRegexToPlannerRawBlock;
     panel.querySelector('#stsw-replan-every').value = settings.replanEvery;
     panel.querySelector('#stsw-injection-position').value = settings.injectionPosition;
@@ -1200,8 +1259,19 @@ async function generatePlan(reason = 'manual') {
         const state = getChatState();
         const plan = await runWithSelectedConnectionProfile(async () => {
             const prompt = await buildPlannerPrompt();
+
+            if (!settings.useProfilePromptStack) {
+                const rawPlan = await generateRaw({
+                    prompt,
+                    responseLength: settings.maxGenerationLength,
+                });
+
+                return removeReasoningFromString(String(rawPlan ?? '').trim());
+            }
+
             return await generateQuietPrompt({
                 quietPrompt: prompt,
+                skipWIAN: true,
                 responseLength: settings.maxGenerationLength,
                 removeReasoning: true,
                 trimToSentence: false,
@@ -1351,6 +1421,10 @@ function bindEvents() {
         handleSettingToggle('includeWorldInfo', event.target.checked);
     });
 
+    panel.querySelector('#stsw-use-profile-prompt-stack').addEventListener('input', event => {
+        handleSettingToggle('useProfilePromptStack', event.target.checked);
+    });
+
     panel.querySelector('#stsw-include-checkpoint-summaries').addEventListener('input', event => {
         handleSettingToggle('includeCheckpointSummaries', event.target.checked);
     });
@@ -1406,12 +1480,11 @@ function bindEvents() {
 
 async function renderUI() {
     const container = document.getElementById('extensions_settings2');
+    const renderVersion = ++runtime.renderVersion;
 
     if (!container) {
         return null;
     }
-
-    document.querySelectorAll(`#${PANEL_ID}`).forEach(node => node.remove());
 
     const settingsPath = `${getExtensionDirectory()}/settings.html`;
     let settingsHtml = '';
@@ -1424,7 +1497,18 @@ async function renderUI() {
         return null;
     }
 
+    if (renderVersion !== runtime.renderVersion) {
+        return getPanel();
+    }
+
+    document.querySelectorAll(`#${PANEL_ID}`).forEach(node => node.remove());
     container.insertAdjacentHTML('beforeend', settingsHtml);
+    document.querySelectorAll(`#${PANEL_ID}`).forEach((node, index) => {
+        if (index > 0) {
+            node.remove();
+        }
+    });
+
     return getPanel();
 }
 
@@ -1446,10 +1530,18 @@ function installApi() {
     };
 }
 
-async function refreshForChat() {
+async function refreshForChat({ allowPrompt = false, triggerReplan = true } = {}) {
     const previousChatKey = runtime.lastSeenChatKey;
     const currentChatKey = getActiveChatKey();
     const isChatEntry = Boolean(currentChatKey) && currentChatKey !== previousChatKey;
+
+    if (!currentChatKey) {
+        runtime.pendingInitialPlanPromptKey = '';
+        clearPendingInitialPlanPrompt();
+    } else if (isChatEntry) {
+        runtime.pendingInitialPlanPromptKey = currentChatKey;
+        clearPendingInitialPlanPrompt();
+    }
 
     runtime.lastSeenChatKey = currentChatKey;
 
@@ -1459,19 +1551,19 @@ async function refreshForChat() {
     fillFormFromState();
     updateInjection();
     const state = getChatState();
-    const shouldPromptForInitialPlan = isChatEntry && getSettings().enabled && !chatHasPlan(state);
+    const shouldPromptForInitialPlan = allowPrompt
+        && Boolean(currentChatKey)
+        && runtime.pendingInitialPlanPromptKey === currentChatKey
+        && getSettings().enabled
+        && !chatHasPlan(state);
 
-    await syncRpCounter({ triggerReplan: !shouldPromptForInitialPlan });
+    await syncRpCounter({ triggerReplan: triggerReplan && !shouldPromptForInitialPlan });
 
     if (!shouldPromptForInitialPlan || runtime.isGenerating || !hasActiveChat()) {
         return;
     }
 
-    const shouldGeneratePlan = window.confirm('Для этого чата у Screenwriter ещё нет плана. Сгенерировать его сейчас?');
-
-    if (shouldGeneratePlan) {
-        await queueGenerate('chat_entry');
-    }
+    scheduleInitialPlanPrompt(currentChatKey);
 }
 
 function registerLifecycle() {
@@ -1480,9 +1572,9 @@ function registerLifecycle() {
     }
 
     lifecycleRegistered = true;
-    eventSource.on(event_types.APP_READY, refreshForChat);
-    eventSource.on(event_types.CHAT_CHANGED, refreshForChat);
-    eventSource.on(event_types.CHAT_LOADED, refreshForChat);
+    eventSource.on(event_types.APP_READY, async () => await refreshForChat({ allowPrompt: false, triggerReplan: false }));
+    eventSource.on(event_types.CHAT_CHANGED, async () => await refreshForChat({ allowPrompt: false, triggerReplan: false }));
+    eventSource.on(event_types.CHAT_LOADED, async () => await refreshForChat({ allowPrompt: true, triggerReplan: true }));
     eventSource.on(event_types.MESSAGE_RECEIVED, async () => await syncRpCounter({ triggerReplan: true }));
     eventSource.on(event_types.MESSAGE_SWIPED, async () => await syncRpCounter({ triggerReplan: true }));
     eventSource.on(event_types.MESSAGE_EDITED, async () => await syncRpCounter({ triggerReplan: true }));
@@ -1503,7 +1595,7 @@ export async function init() {
     ensureSettings();
     installApi();
     registerLifecycle();
-    await refreshForChat();
+    await refreshForChat({ allowPrompt: false, triggerReplan: false });
 }
 
 jQuery(() => {
