@@ -124,6 +124,7 @@ const runtime = {
     abortRequested: false,
     lastError: '',
     lastAutoReplanSignature: '',
+    lastSeenChatKey: '',
 };
 
 let initialized = false;
@@ -204,6 +205,28 @@ function hasActiveChat() {
     return context.groupId || context.characterId !== undefined;
 }
 
+function getActiveChatKey() {
+    const context = getContext();
+
+    if (!context) {
+        return '';
+    }
+
+    if (context.chatId !== undefined && context.chatId !== null && String(context.chatId).trim()) {
+        return `chat:${String(context.chatId)}`;
+    }
+
+    if (context.groupId !== undefined && context.groupId !== null && String(context.groupId).trim()) {
+        return `group:${String(context.groupId)}`;
+    }
+
+    if (context.characterId !== undefined && context.characterId !== null) {
+        return `character:${String(context.characterId)}`;
+    }
+
+    return '';
+}
+
 function getPanel() {
     return document.getElementById(PANEL_ID);
 }
@@ -219,6 +242,10 @@ function getPlanTextarea() {
 
 function getCurrentPlanText() {
     return getPlanTextarea()?.value ?? getChatState().currentPlan ?? '';
+}
+
+function chatHasPlan(state = getChatState()) {
+    return Boolean(String(getCurrentPlanText() ?? '').trim() || String(state?.currentPlan ?? '').trim());
 }
 
 function checkConnectionProfilesActive() {
@@ -1207,7 +1234,7 @@ async function generatePlan(reason = 'manual') {
         updateInjection();
         renderStatus();
 
-        if (reason === 'manual' || reason === 'external_event') {
+        if (reason === 'manual' || reason === 'external_event' || reason === 'chat_entry') {
             toastr.success('Screenwriter plan updated');
         }
 
@@ -1420,12 +1447,31 @@ function installApi() {
 }
 
 async function refreshForChat() {
+    const previousChatKey = runtime.lastSeenChatKey;
+    const currentChatKey = getActiveChatKey();
+    const isChatEntry = Boolean(currentChatKey) && currentChatKey !== previousChatKey;
+
+    runtime.lastSeenChatKey = currentChatKey;
+
     await renderUI();
     bindEvents();
     await updateConnectionProfileDropdown();
     fillFormFromState();
     updateInjection();
-    await syncRpCounter({ triggerReplan: true });
+    const state = getChatState();
+    const shouldPromptForInitialPlan = isChatEntry && getSettings().enabled && !chatHasPlan(state);
+
+    await syncRpCounter({ triggerReplan: !shouldPromptForInitialPlan });
+
+    if (!shouldPromptForInitialPlan || runtime.isGenerating || !hasActiveChat()) {
+        return;
+    }
+
+    const shouldGeneratePlan = window.confirm('Для этого чата у Screenwriter ещё нет плана. Сгенерировать его сейчас?');
+
+    if (shouldGeneratePlan) {
+        await queueGenerate('chat_entry');
+    }
 }
 
 function registerLifecycle() {
