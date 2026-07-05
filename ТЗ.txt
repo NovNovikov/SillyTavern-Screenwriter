@@ -1,0 +1,632 @@
+# ТЗ: SillyTavern Extension “Сценарист” / “Screenwriter”
+
+## 1. Цель
+
+Разработать расширение для SillyTavern, которое добавляет скрытый сценарный planning-layer для roleplay-чата.
+
+Проблема: обычный roleplay в SillyTavern часто имеет горизонт планирования в одно сообщение. Модель реагирует на последний ход, но плохо держит долгосрочную драматическую дугу, подготовку событий, последствия старых решений и скрытые действия NPC.
+
+Решение: расширение “Сценарист” периодически генерирует и хранит скрытый структурированный план истории. Этот план инжектится в prompt как режиссёрская установка, но не отображается игроку как обычное сообщение чата и не ломает swipe.
+
+## 2. Ключевые требования
+
+### 2.1. Расширение, не Quick Reply
+
+Реализовать именно как полноценное SillyTavern UI extension, а не как набор STscript/Quick Reply.
+
+Причины:
+
+* нужна постоянная панель настроек;
+* нужен editable блок текущего плана;
+* нужен счётчик сообщений;
+* нужна автогенерация по событиям;
+* нужна ручная перегенерация;
+* нужно хранение данных per-chat;
+* нельзя плодить служебные сообщения в чате, чтобы не ломать swipe.
+
+### 2.2. Не создавать сообщений в чате
+
+Расширение не должно добавлять отдельные chat messages с планом.
+
+План должен храниться во внутреннем состоянии расширения и/или metadata текущего чата и инжектиться в prompt скрыто.
+
+Важно: отдельные сообщения ломают swipe, потому что SillyTavern позволяет свайпать только последнее сообщение.
+
+## 3. Основная концепция
+
+Расширение должно работать как скрытый “сценарист”:
+
+1. Отслеживает roleplay-сообщения.
+2. Каждые N roleplay-сообщений генерирует новый план.
+3. Может перегенерировать план немедленно при внешнем событии: “Чёрный Лебедь”, “Птица Счастья”, ручной replan.
+4. Хранит текущий план в UI под collapsible/spoiler-блоком.
+5. Позволяет вручную редактировать текущий план.
+6. Инжектит актуальный план в prompt как скрытую режиссёрскую инструкцию.
+7. Не раскрывает план игроку напрямую через обычные ответы модели.
+
+## 4. UI расширения
+
+Добавить панель “Сценарист” в Extensions UI.
+
+### 4.1. Основные controls
+
+Панель должна содержать:
+
+* Checkbox: `Enable Screenwriter`
+
+  * Полностью включает/выключает расширение.
+
+* Checkbox: `Auto-generate plans`
+
+  * Если включено, план автоматически обновляется каждые N roleplay-сообщений.
+  * Если выключено, пользователь может писать/править план вручную, а расширение только инжектит его.
+
+* Numeric input: `Replan every N RP messages`
+
+  * Default: 30.
+  * Min: 1.
+  * Max: 500.
+  * Используется только если `Auto-generate plans` включён.
+
+* Checkbox: `Replan after external event`
+
+  * Если включено, события типа Black Swan / Bird of Happiness форсят перегенерацию.
+
+* Checkbox: `Inject current plan into prompt`
+
+  * Если выключено, план хранится/редактируется, но не добавляется в prompt.
+
+* Select/input: `Injection position`
+
+  * Варианты:
+
+    * before main prompt;
+    * after main prompt;
+    * before character;
+    * depth/in-chat injection if supported;
+    * custom extension-defined position if SillyTavern API allows.
+  * Codex must inspect current SillyTavern extension/injection APIs and implement the safest supported variant.
+
+* Textarea: `Screenwriter generation prompt`
+
+  * Пользовательский prompt для нейронки.
+  * Должен поддерживать macro/template-поля:
+
+    * `{{recentChat}}`
+    * `{{currentPlan}}`
+    * `{{statusBlock}}`
+    * `{{eventNote}}`
+    * `{{characterName}}`
+    * `{{userName}}`
+    * `{{messageCount}}`
+    * `{{worldInfoSummary}}` if available.
+
+* Numeric input: `Recent chat messages to include`
+
+  * Default: 30.
+  * Сколько последних сообщений отправлять Сценаристу при генерации плана.
+
+* Numeric input: `Max generation length`
+
+  * Default: 800–1200 tokens.
+  * Должно быть настраиваемо.
+
+* Optional select: `Generation preset / profile`
+
+  * Использовать текущий active connection/preset по умолчанию.
+  * Если SillyTavern API позволяет выбрать completion preset/API preset — дать выбор.
+  * Если нет стабильного API, оставить как future TODO, но не ломать базовую работу.
+
+### 4.2. Блок текущего плана
+
+В UI должен быть collapsible/spoiler-блок:
+
+Title: `Current Hidden Plan`
+
+Внутри:
+
+* textarea с текущим планом;
+* кнопка `Save Plan`;
+* кнопка `Generate/Replan Now`;
+* кнопка `Clear Plan`;
+* кнопка `Copy Plan`;
+* индикатор:
+
+  * last generated at message id / timestamp;
+  * RP messages since last plan;
+  * pending external event: yes/no;
+  * extension enabled: yes/no;
+  * injection enabled: yes/no.
+
+Текущий план должен быть редактируемым руками. Пользователь может полностью отключить автогенерацию и вести план вручную.
+
+## 5. Формат плана
+
+Generated plan должен быть структурированным. Default prompt должен требовать примерно такой формат:
+
+```
+[СЦЕНАРИСТ: скрытый план]
+
+Текущая драматическая дуга:
+...
+
+Ближайший горизонт, 1-5 RP-сообщений:
+- ...
+
+Средний горизонт, 5-20 RP-сообщений:
+- ...
+
+Дальний горизонт, 20-60 RP-сообщений:
+- ...
+
+Скрытые действия NPC:
+- ...
+
+Отложенные последствия:
+- ...
+
+Скрытые угрозы:
+- ...
+
+Скрытые возможности:
+- ...
+
+Правила ведения:
+- Не раскрывать план напрямую.
+- Не рельсить игрока.
+- Подавать события через естественные зацепки.
+- Уважать выбор игрока.
+- Учитывать неожиданные события как канон, а не откатывать их.
+```
+
+Расширение не обязано жёстко парсить этот формат на MVP-этапе, но должно сохранять plan text как редактируемый plain text.
+
+## 6. Default generation prompt
+
+Добавить default prompt:
+
+```
+Ты скрытый сценарист roleplay-истории. Твоя задача — не писать следующий ответ персонажа, а обновить долгосрочный скрытый план истории.
+
+Используй текущий план, недавнюю историю, статус персонажа и внешнее событие, если оно есть.
+
+Сделай план живым, но не рельсовым. Не отменяй неожиданные события. Если произошло событие типа катастрофы, удачи, вмешательства NPC или случайного поворота, перестрой дальнейшую дугу так, будто это теперь часть канона.
+
+Не раскрывай план игроку напрямую. План предназначен только для скрытой режиссёрской установки модели.
+
+Верни только обновлённый план в следующей структуре:
+
+[СЦЕНАРИСТ: скрытый план]
+
+Текущая драматическая дуга:
+...
+
+Ближайший горизонт, 1-5 RP-сообщений:
+- ...
+
+Средний горизонт, 5-20 RP-сообщений:
+- ...
+
+Дальний горизонт, 20-60 RP-сообщений:
+- ...
+
+Скрытые действия NPC:
+- ...
+
+Отложенные последствия:
+- ...
+
+Скрытые угрозы:
+- ...
+
+Скрытые возможности:
+- ...
+
+Правила ведения:
+- ...
+```
+
+В UI prompt должен быть полностью редактируемым.
+
+## 7. Определение RP-сообщений
+
+Для MVP считать RP-сообщением последнее assistant/character сообщение, содержащее строку:
+
+```
+Состояние:
+```
+
+Это важно, потому что в текущем workflow статусный блок уже является маркером полноценного roleplay-поста.
+
+Требование:
+
+* сообщения без `Состояние:` не должны увеличивать счётчик RP-сообщений;
+* служебные сообщения, STCS-дельты, system-like ответы, debug output не должны запускать replan;
+* регистр не важен;
+* допускаются пробелы: `Состояние :`, `Состояние:`.
+
+Regex:
+
+```
+/Состояние\s*:/i
+```
+
+Не использовать regex с `|`, если это реализуется через STscript. В JS можно использовать обычный RegExp.
+
+## 8. Автогенерация
+
+### 8.1. Счётчик
+
+Extension должен хранить per-chat:
+
+* `rpMessagesSinceLastPlan`;
+* `lastPlannedMessageId`;
+* `lastPlanGeneratedAt`;
+* `currentPlan`;
+* `pendingEvent`;
+* `pendingEventType`;
+* `pendingEventNote`.
+
+При появлении нового assistant/character message:
+
+1. Проверить, включён ли extension.
+2. Проверить, включена ли auto-generation.
+3. Проверить, содержит ли сообщение `Состояние:`.
+4. Если да — увеличить `rpMessagesSinceLastPlan`.
+5. Если `rpMessagesSinceLastPlan >= N`, вызвать генерацию плана.
+6. После успешной генерации:
+
+   * обновить `currentPlan`;
+   * сбросить `rpMessagesSinceLastPlan = 0`;
+   * очистить pending event;
+   * сохранить metadata.
+
+### 8.2. External event force replan
+
+Если установлен `pendingEvent`, и включён `Replan after external event`, extension должен запустить replan немедленно или при ближайшем безопасном событии после завершения текущей генерации.
+
+Важно:
+
+* не запускать параллельные replan;
+* если generation уже идёт, поставить флаг queued replan;
+* после окончания текущего replan выполнить queued replan один раз.
+
+## 9. Интеграция с Black Swan / Bird of Happiness
+
+Extension должен предоставить JS API в window namespace, например:
+
+```
+window.STScreenwriter = {
+  requestReplan({ type, note, source }),
+  setEvent({ type, note, source }),
+  getPlan(),
+  setPlan(text),
+  clearPlan(),
+  generateNow()
+}
+```
+
+Пример вызова из внешнего скрипта:
+
+```
+window.STScreenwriter.requestReplan({
+  type: "black_swan",
+  note: "Внезапное плохое событие: ...",
+  source: "Black Swan script"
+});
+```
+
+Для “Птицы Счастья”:
+
+```
+window.STScreenwriter.requestReplan({
+  type: "bird_of_happiness",
+  note: "Внезапное хорошее событие: ...",
+  source: "Bird of Happiness script"
+});
+```
+
+Если прямой JS-вызов из пользовательских скриптов неудобен, Codex должен проверить возможность:
+
+* зарегистрировать slash command;
+* слушать custom DOM event;
+* слушать изменение chat metadata;
+* предоставить QR-compatible endpoint через extension command.
+
+Минимально обязательный вариант: `window.STScreenwriter.requestReplan(...)`.
+
+## 10. Prompt injection
+
+Extension должен инжектить текущий план в prompt только если:
+
+* extension enabled;
+* injection enabled;
+* currentPlan is not empty.
+
+Injected block:
+
+```
+[СКРЫТЫЙ СЦЕНАРНЫЙ ПЛАН / НЕ ПОКАЗЫВАТЬ ИГРОКУ]
+
+Ты должен использовать этот план как режиссёрскую ориентацию, но не раскрывать его напрямую.
+Не рельсь игрока. Не заставляй персонажей делать невозможное. Используй план через намёки, подготовку событий, NPC-инициативу, последствия и естественные зацепки.
+
+<currentPlan>
+...
+</currentPlan>
+```
+
+Нужно проверить current SillyTavern extension APIs для prompt injection. Если есть несколько вариантов, выбрать тот, который:
+
+* не создаёт chat messages;
+* сохраняется per-chat;
+* не ломает swipe;
+* легко отключается.
+
+Если официальный/стабильный injection API недоступен, Codex должен реализовать fallback через существующие extension hooks или metadata-driven injection, но без создания новых сообщений в чате.
+
+## 11. Генерация плана через LLM
+
+Codex должен изучить текущий SillyTavern frontend API и реализовать generation call тем способом, который принят в текущем SillyTavern для extensions.
+
+Требования:
+
+* использовать текущий активный API/connection/preset, если специальный selection не реализован;
+* не добавлять результат генерации как chat message;
+* показывать spinner/status в UI;
+* обрабатывать ошибки;
+* не запускать две генерации одновременно;
+* иметь кнопку cancel if available;
+* сохранять старый plan, если generation failed;
+* показывать error message в UI.
+
+Input для планировщика должен включать:
+
+* current plan;
+* recent chat context;
+* current visible status block if available;
+* pending event note if available;
+* character/user names if available;
+* current chat title/id if useful.
+
+## 12. Хранение данных
+
+Данные должны быть per-chat, а не global, кроме default settings.
+
+Global settings:
+
+* enabled by default;
+* default auto-generation enabled/disabled;
+* default N messages;
+* default generation prompt;
+* default injection position;
+* default max generation length;
+* UI preferences.
+
+Per-chat data:
+
+* currentPlan;
+* rpMessagesSinceLastPlan;
+* lastPlannedMessageId;
+* lastPlanGeneratedAt;
+* pendingEvent;
+* pendingEventType;
+* pendingEventNote;
+* manualMode flag if needed.
+
+Codex должен проверить текущий SillyTavern extension settings/context API и выбрать правильный способ хранения:
+
+* global extension settings для defaults;
+* chat metadata / extension metadata для per-chat plan.
+
+Обязательно:
+
+* данные должны переживать reload страницы;
+* при смене чата должен загружаться план именно этого чата;
+* при новом чате currentPlan должен быть пустой, если нет сохранённых данных.
+
+## 13. Режим ручного планирования
+
+Если `Auto-generate plans` выключен:
+
+* extension не вызывает LLM сам;
+* счётчик можно продолжать вести, но generation не запускается;
+* пользователь может вручную писать plan в textarea;
+* plan всё равно может инжектиться в prompt, если включён `Inject current plan`.
+
+Use case: пользователь сам пишет скрытый outline для модели.
+
+## 14. Безопасность от поломки swipe
+
+Жёсткое требование:
+
+* extension не должен создавать chat messages автоматически;
+* plan generation result не должен попадать в историю как assistant/user message;
+* service/debug messages не должны становиться последним сообщением чата;
+* все операции должны происходить через extension state, metadata, prompt injection или UI.
+
+## 15. Минимальный MVP
+
+MVP считается готовым, если:
+
+1. Extension появляется в UI.
+2. Есть настройки:
+
+   * enabled;
+   * auto-generate;
+   * N messages;
+   * prompt textarea;
+   * current plan textarea;
+   * generate now;
+   * save;
+   * clear.
+3. Plan хранится per-chat.
+4. Plan можно руками редактировать.
+5. Plan инжектится в prompt.
+6. Extension считает только assistant messages с `Состояние:`.
+7. Каждые N таких сообщений запускает silent LLM generation.
+8. Generated plan не создаёт chat message.
+9. Black Swan / Bird of Happiness могут вызвать replan через `window.STScreenwriter.requestReplan`.
+10. Swipe не ломается.
+
+## 16. Acceptance tests
+
+### Test 1: UI loads
+
+* Установить extension.
+* Открыть SillyTavern.
+* Проверить, что появилась панель “Сценарист”.
+* Ошибок в browser console нет.
+
+### Test 2: Manual plan
+
+* Отключить auto-generate.
+* Ввести план руками.
+* Нажать Save.
+* Перезагрузить страницу.
+* План остался в текущем чате.
+* Открыть другой чат.
+* Там план пустой или другой, не глобально общий.
+
+### Test 3: Injection
+
+* Включить injection.
+* Ввести тестовый plan с уникальной фразой.
+* Запустить generation обычного RP-ответа.
+* Проверить через prompt/debug tools, что уникальная фраза попала в outgoing prompt.
+* Проверить, что она не появилась как обычное chat message.
+
+### Test 4: RP counter
+
+* Отправить assistant message без `Состояние:`.
+* Counter не увеличился.
+* Отправить assistant message с `Состояние:`.
+* Counter увеличился.
+
+### Test 5: Auto replan
+
+* Поставить N = 2.
+* Получить два RP-сообщения с `Состояние:`.
+* Extension silently генерирует plan.
+* Plan textarea обновляется.
+* В чат не добавляется новое сообщение.
+
+### Test 6: External event
+
+* В console вызвать:
+
+  ```
+  window.STScreenwriter.requestReplan({
+    type: "black_swan",
+    note: "Тестовое катастрофическое событие",
+    source: "manual console test"
+  });
+  ```
+* Extension запускает replan или ставит pending event.
+* Новый plan учитывает note.
+* pending event очищается после успешной генерации.
+
+### Test 7: Swipe safety
+
+* Получить RP-ответ.
+* Extension не создаёт дополнительное сообщение после него.
+* Swipe доступен без удаления служебных сообщений.
+* После swipe extension не должен считать старый discarded response как новый канон.
+
+### Test 8: Failed generation
+
+* Искусственно сломать API или отключить connection.
+* Нажать Generate Now.
+* Старый plan не затирается пустотой.
+* UI показывает ошибку.
+* Console содержит понятный error.
+
+## 17. Implementation notes for Codex
+
+Codex must inspect current SillyTavern source before choosing exact imports/API names.
+
+Expected areas to inspect:
+
+* official extension examples;
+* extension settings storage;
+* chat metadata APIs;
+* eventSource / event_types;
+* prompt injection hooks;
+* generation helper functions used by other extensions;
+* slash command registration if needed;
+* DOM structure for extension panels.
+
+Do not guess unstable internal function names. If an API is unclear, implement a small proof-of-concept first:
+
+1. load panel;
+2. save per-chat text;
+3. inject static text;
+4. call silent generation;
+5. then combine.
+
+## 18. Suggested file structure
+
+Use standard SillyTavern extension layout. Exact names may follow current extension conventions.
+
+Suggested:
+
+```
+public/scripts/extensions/third-party/st-screenwriter/
+  manifest.json
+  index.js
+  style.css
+  README.md
+```
+
+If current SillyTavern expects another layout, follow the current standard.
+
+## 19. README requirements
+
+README must include:
+
+* what the extension does;
+* installation path;
+* how to enable;
+* how to configure N messages;
+* how to edit the plan manually;
+* how to connect Black Swan / Bird of Happiness;
+* example `window.STScreenwriter.requestReplan(...)`;
+* known limitations;
+* warning that the plan is hidden from normal chat but visible to the local user in extension UI.
+
+## 20. Non-goals for MVP
+
+Do not implement in MVP unless easy:
+
+* complex graph of plot threads;
+* visual timeline;
+* multi-plan branching;
+* automatic summarization of all lore;
+* deep World Info editing;
+* server plugin;
+* cloud sync;
+* multi-user permissions.
+
+These can be future features.
+
+## 21. Future features
+
+Possible later improvements:
+
+* structured JSON plan mode;
+* plan diff viewer;
+* separate tabs: plot / NPC / threats / opportunities / unresolved consequences;
+* “soft railroading level” slider;
+* per-character planning style;
+* manual “mark event as canon” button;
+* integration with status delta system;
+* integration with random event scripts;
+* plan history / rollback;
+* export/import plan;
+* branch-aware planning after swipe.
+
+## 22. Critical design rule
+
+The extension must never turn the hidden plan into a visible chat message unless the user explicitly presses an export/debug button.
+
+The whole point is to create a hidden planning layer that improves long-term story coherence without blocking swipe, without cluttering chat history, and without revealing future events to the player.

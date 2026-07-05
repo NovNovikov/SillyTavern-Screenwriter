@@ -1,0 +1,13 @@
+{
+    "name": "st-screenwriter",
+    "display_name": "Screenwriter",
+    "loading_order": 120,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "OpenAI Codex",
+    "description": "Hidden per-chat planning layer for SillyTavern roleplay with silent replans, prompt injection, and external event hooks.",
+    "version": "0.1.0",
+    "manifest_version": 3
+}

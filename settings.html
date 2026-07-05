@@ -1,0 +1,108 @@
+<div id="st-screenwriter-settings">
+    <div class="inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header">
+            <b>Screenwriter</b>
+            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+        </div>
+        <div class="inline-drawer-content">
+            <div class="stsw-row">
+                <label><input id="stsw-enabled" type="checkbox"> Enable Screenwriter</label>
+                <label><input id="stsw-auto-generate" type="checkbox"> Auto-generate plans</label>
+                <label><input id="stsw-auto-recent-chat-count" type="checkbox"> Automatic recent chat count</label>
+                <label><input id="stsw-replan-on-event" type="checkbox"> Replan after external event</label>
+                <label><input id="stsw-inject-plan" type="checkbox"> Inject current plan into prompt</label>
+                <label><input id="stsw-include-world-info" type="checkbox"> Include full World Info in plan generation</label>
+                <label><input id="stsw-apply-regex-raw-block" type="checkbox"> Apply regex to planner raw block</label>
+            </div>
+
+            <div class="stsw-grid">
+                <label class="stsw-field">
+                    <span>Replan every N RP messages</span>
+                    <input id="stsw-replan-every" class="text_pole" type="number" min="1" max="500">
+                </label>
+                <label class="stsw-field">
+                    <span>Injection position</span>
+                    <select id="stsw-injection-position" class="text_pole">
+                        <option value="before_prompt">Before main prompt</option>
+                        <option value="in_prompt">After main prompt</option>
+                        <option value="in_chat">In-chat at depth</option>
+                    </select>
+                </label>
+                <label class="stsw-field">
+                    <span>In-chat injection depth</span>
+                    <input id="stsw-injection-depth" class="text_pole" type="number" min="0" max="9999">
+                </label>
+                <label class="stsw-field">
+                    <span>Recent chat messages to include</span>
+                    <input id="stsw-recent-chat-messages" class="text_pole" type="number" min="1" max="200">
+                </label>
+                <label class="stsw-field">
+                    <span>Max generation length</span>
+                    <input id="stsw-max-generation-length" class="text_pole" type="number" min="64" max="4096">
+                </label>
+            </div>
+
+            <label class="stsw-field">
+                <span>Screenwriter generation prompt</span>
+                <textarea id="stsw-generation-prompt" class="text_pole" rows="12"></textarea>
+            </label>
+            <div class="stsw-help stsw-macro-list">
+                Available macros: <code>{{recentChat}}</code>, <code>{{currentPlan}}</code>, <code>{{statusBlock}}</code>,
+                <code>{{eventNote}}</code>, <code>{{characterName}}</code>, <code>{{userName}}</code>,
+                <code>{{messageCount}}</code>
+            </div>
+
+            <hr class="sysHR">
+
+            <div class="inline-drawer">
+                <div class="inline-drawer-toggle inline-drawer-header">
+                    <b>Current Hidden Plan</b>
+                    <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+                </div>
+                <div class="inline-drawer-content">
+                    <textarea id="stsw-current-plan" class="text_pole" rows="16"></textarea>
+                    <div class="stsw-actions">
+                        <button id="stsw-save-plan" class="menu_button">Save Plan</button>
+                        <button id="stsw-generate-now" class="menu_button">Generate/Replan Now</button>
+                        <button id="stsw-clear-plan" class="menu_button">Clear Plan</button>
+                        <button id="stsw-copy-plan" class="menu_button">Copy Plan</button>
+                    </div>
+                    <div class="stsw-status">
+                        <div class="stsw-status-item">
+                            <b>Last generated at</b>
+                            <span id="stsw-status-last-plan">Never</span>
+                        </div>
+                        <div class="stsw-status-item">
+                            <b>Last planned message id</b>
+                            <span id="stsw-status-last-message">None</span>
+                        </div>
+                        <div class="stsw-status-item">
+                            <b>RP messages since last plan</b>
+                            <span id="stsw-status-rp-count">0</span>
+                        </div>
+                        <div class="stsw-status-item">
+                            <b>Pending external event</b>
+                            <span id="stsw-status-pending-event">No</span>
+                        </div>
+                        <div class="stsw-status-item">
+                            <b>Extension enabled</b>
+                            <span id="stsw-status-enabled">Yes</span>
+                        </div>
+                        <div class="stsw-status-item">
+                            <b>Injection enabled</b>
+                            <span id="stsw-status-injection">Yes</span>
+                        </div>
+                        <div class="stsw-status-item">
+                            <b>Runtime status</b>
+                            <span id="stsw-runtime-status">Idle</span>
+                        </div>
+                        <div class="stsw-status-item">
+                            <b>Last error</b>
+                            <span id="stsw-last-error">None</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
