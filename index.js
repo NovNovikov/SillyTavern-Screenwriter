@@ -399,6 +399,11 @@ function isRoleplayAssistantMessage(message) {
     return !rawText.includes(STCS_HIDDEN_BLOCK_MARKER);
 }
 
+function hasHiddenStcsBlock(message) {
+    const rawText = String(message?.mes ?? message?.message ?? message?.content ?? '');
+    return rawText.includes(STCS_HIDDEN_BLOCK_MARKER);
+}
+
 function computeRpMetrics(chat, state) {
     if (!Array.isArray(chat) || chat.length === 0) {
         return { count: 0, latestRpMessageId: -1 };
@@ -790,6 +795,7 @@ function getRecentChatCandidates() {
     return chat
         .map((message, index) => ({ message, index }))
         .filter(entry => !entry.message?.is_system)
+        .filter(entry => !hasHiddenStcsBlock(entry.message))
         .map(entry => {
             const text = getPlannerMessageText(entry.message, entry.index, chat);
             const speaker = entry.message.is_user
