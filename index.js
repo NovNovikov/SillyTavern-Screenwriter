@@ -16,8 +16,17 @@ import { getRegexedString, regex_placement } from '../../regex/engine.js';
 const MODULE_NAME = 'st-screenwriter';
 const PANEL_ID = 'st-screenwriter-settings';
 const STATE_KEY = MODULE_NAME;
+const CHECKPOINT_SUMMARIZE_METADATA_KEY = 'checkpoint_summarize';
 const STCS_HIDDEN_BLOCK_MARKER = '<!--STCS_START-->';
 const AUTO_RECENT_CHAT_SAFETY_BUFFER_TOKENS = 2000;
+const DEFAULT_CHECKPOINT_INJECTION_TEMPLATE = `[Checkpoint Memory]
+
+The following are manually reviewed checkpoint summaries of earlier chat history.
+Treat them as established continuity/canon unless contradicted by more recent raw messages.
+
+{{checkpoint_blocks}}
+
+[End Checkpoint Memory]`;
 
 const DEFAULT_GENERATION_PROMPT = `Ты скрытый сценарист roleplay-истории. Твоя задача — не писать следующий ответ персонажа, а обновить долгосрочный скрытый план истории.
 
@@ -89,6 +98,7 @@ const DEFAULT_SETTINGS = {
     injectionPosition: 'before_prompt',
     injectionDepth: 4,
     generationPrompt: DEFAULT_GENERATION_PROMPT,
+    includeCheckpointSummaries: true,
     includeWorldInfo: true,
     applyRegexToPlannerRawBlock: true,
     autoRecentChatCount: true,
@@ -122,6 +132,25 @@ let connectionProfilesActive;
 
 const saveMetadataDebounced = debounce(async () => await getContext().saveMetadata(), 1000);
 
+function getMetadataRoot() {
+    const context = getContext();
+
+    if (!context) {
+        return null;
+    }
+
+    if (context.chatMetadata && typeof context.chatMetadata === 'object') {
+        return context.chatMetadata;
+    }
+
+    if (context.chat_metadata && typeof context.chat_metadata === 'object') {
+        return context.chat_metadata;
+    }
+
+    context.chatMetadata = {};
+    return context.chatMetadata;
+}
+
 function ensureSettings() {
     extension_settings[MODULE_NAME] = extension_settings[MODULE_NAME] ?? {};
 
@@ -139,8 +168,8 @@ function getSettings() {
 }
 
 function getRawChatState() {
-    const context = getContext();
-    const stored = context.chatMetadata?.[STATE_KEY];
+    const metadata = getMetadataRoot();
+    const stored = metadata?.[STATE_KEY];
     return stored && typeof stored === 'object' ? stored : {};
 }
 
@@ -150,8 +179,14 @@ function getChatState() {
 
 function writeChatState(patch, persistMode = 'debounced') {
     const context = getContext();
+    const metadata = getMetadataRoot();
     const nextState = { ...getChatState(), ...patch };
-    context.chatMetadata[STATE_KEY] = nextState;
+
+    if (!context || !metadata) {
+        return Promise.resolve(nextState);
+    }
+
+    metadata[STATE_KEY] = nextState;
 
     if (persistMode === 'immediate') {
         return context.saveMetadata().then(() => nextState);
@@ -806,7 +841,7 @@ function getRecentChatCandidates() {
         });
 }
 
-async function resolveRecentChatText(worldInfoText = '') {
+async function resolveRecentChatText(worldInfoText = '', checkpointMemoryText = '') {
     const context = getContext();
     const settings = getSettings();
     const state = getChatState();
@@ -834,11 +869,14 @@ async function resolveRecentChatText(worldInfoText = '') {
 
     const basePrompt = applyTemplate(settings.generationPrompt, baseVariables);
     const basePromptTokens = await countTextTokens(basePrompt);
+    const checkpointMemoryTokens = checkpointMemoryText
+        ? await countTextTokens(checkpointMemoryText)
+        : 0;
     const worldInfoBlock = settings.includeWorldInfo && worldInfoText
         ? ['[World Info]', worldInfoText, '[End World Info]'].join('\n')
         : '';
     const worldInfoTokens = worldInfoBlock ? await countTextTokens(worldInfoBlock) : 0;
-    const availableRecentChatTokens = totalBudget - basePromptTokens - worldInfoTokens - AUTO_RECENT_CHAT_SAFETY_BUFFER_TOKENS;
+    const availableRecentChatTokens = totalBudget - basePromptTokens - checkpointMemoryTokens - worldInfoTokens - AUTO_RECENT_CHAT_SAFETY_BUFFER_TOKENS;
 
     if (availableRecentChatTokens <= 0) {
         return '';
@@ -860,10 +898,10 @@ async function resolveRecentChatText(worldInfoText = '') {
     return selected.join('\n\n');
 }
 
-async function buildGenerationVariables(worldInfoText = '') {
+async function buildGenerationVariables(worldInfoText = '', checkpointMemoryText = '') {
     const context = getContext();
     const state = getChatState();
-    const recentChat = await resolveRecentChatText(worldInfoText);
+    const recentChat = await resolveRecentChatText(worldInfoText, checkpointMemoryText);
 
     return {
         recentChat,
@@ -880,23 +918,85 @@ function applyTemplate(template, variables) {
     return String(template ?? '').replace(/{{\s*([a-zA-Z0-9_]+)\s*}}/g, (_, key) => String(variables[key] ?? ''));
 }
 
-async function buildPlannerPrompt() {
-    const settings = getSettings();
-    const worldInfo = settings.includeWorldInfo ? await getFullWorldInfoText() : '';
-    const variables = await buildGenerationVariables(worldInfo);
-    const basePrompt = applyTemplate(settings.generationPrompt, variables);
+function getCheckpointSummarizeState() {
+    const metadata = getMetadataRoot();
+    const state = metadata?.[CHECKPOINT_SUMMARIZE_METADATA_KEY];
+    return state && typeof state === 'object' ? state : null;
+}
 
-    if (!settings.includeWorldInfo || !worldInfo) {
-        return basePrompt;
+function getInjectableLockedCheckpointBlocks(checkpointState) {
+    const blocks = Array.isArray(checkpointState?.blocks) ? checkpointState.blocks : [];
+    return blocks.filter(block => block?.locked === true && block?.inject !== false);
+}
+
+function isRangeCheckpoint(block) {
+    const start = Number(block?.startIndex);
+    const end = Number(block?.endIndex);
+    return !block?.memoryOnly && Number.isInteger(start) && Number.isInteger(end) && start >= 0 && end >= start;
+}
+
+function buildCheckpointBlocksText(checkpointState) {
+    const blocks = getInjectableLockedCheckpointBlocks(checkpointState);
+
+    if (!blocks.length) {
+        return '';
     }
 
-    return [
-        '[World Info]',
-        worldInfo,
-        '[End World Info]',
-        '',
-        basePrompt,
-    ].join('\n');
+    return blocks
+        .map((block, index) => {
+            const checkpointNumber = String(index + 1).padStart(3, '0');
+            const summary = String(block?.summary ?? '').trim();
+            const rangeLabel = isRangeCheckpoint(block)
+                ? `${block.startIndex}-${block.endIndex}`
+                : 'memory-only';
+
+            return `[Checkpoint ${checkpointNumber} | messages ${rangeLabel}]\n${summary}`;
+        })
+        .join('\n\n');
+}
+
+function buildCheckpointMemoryText() {
+    const settings = getSettings();
+
+    if (!settings.includeCheckpointSummaries) {
+        return '';
+    }
+
+    const checkpointState = getCheckpointSummarizeState();
+    const blocksText = buildCheckpointBlocksText(checkpointState);
+
+    if (!blocksText.trim()) {
+        return '';
+    }
+
+    const template = checkpointState?.settings?.injectionTemplate || DEFAULT_CHECKPOINT_INJECTION_TEMPLATE;
+    return applyTemplate(template, {
+        checkpoint_blocks: blocksText,
+    }).trim();
+}
+
+async function buildPlannerPrompt() {
+    const settings = getSettings();
+    const checkpointMemory = buildCheckpointMemoryText();
+    const worldInfo = settings.includeWorldInfo ? await getFullWorldInfoText() : '';
+    const variables = await buildGenerationVariables(worldInfo, checkpointMemory);
+    const basePrompt = applyTemplate(settings.generationPrompt, variables);
+    const blocks = [];
+
+    if (checkpointMemory) {
+        blocks.push(checkpointMemory);
+    }
+
+    if (settings.includeWorldInfo && worldInfo) {
+        blocks.push([
+            '[World Info]',
+            worldInfo,
+            '[End World Info]',
+        ].join('\n'));
+    }
+
+    blocks.push(basePrompt);
+    return blocks.join('\n\n');
 }
 
 function renderStatus() {
@@ -972,6 +1072,7 @@ function fillFormFromState() {
     panel.querySelector('#stsw-auto-recent-chat-count').checked = !!settings.autoRecentChatCount;
     panel.querySelector('#stsw-replan-on-event').checked = !!settings.replanAfterExternalEvent;
     panel.querySelector('#stsw-inject-plan').checked = !!settings.injectPlan;
+    panel.querySelector('#stsw-include-checkpoint-summaries').checked = !!settings.includeCheckpointSummaries;
     panel.querySelector('#stsw-include-world-info').checked = !!settings.includeWorldInfo;
     panel.querySelector('#stsw-apply-regex-raw-block').checked = !!settings.applyRegexToPlannerRawBlock;
     panel.querySelector('#stsw-replan-every').value = settings.replanEvery;
@@ -1221,6 +1322,10 @@ function bindEvents() {
 
     panel.querySelector('#stsw-include-world-info').addEventListener('input', event => {
         handleSettingToggle('includeWorldInfo', event.target.checked);
+    });
+
+    panel.querySelector('#stsw-include-checkpoint-summaries').addEventListener('input', event => {
+        handleSettingToggle('includeCheckpointSummaries', event.target.checked);
     });
 
     panel.querySelector('#stsw-apply-regex-raw-block').addEventListener('input', event => {
