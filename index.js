@@ -16,7 +16,7 @@ import { getRegexedString, regex_placement } from '../../regex/engine.js';
 const MODULE_NAME = 'st-screenwriter';
 const PANEL_ID = 'st-screenwriter-settings';
 const STATE_KEY = MODULE_NAME;
-const RP_STATUS_REGEX = /Состояние\s*:/i;
+const STCS_HIDDEN_BLOCK_MARKER = '<!--STCS_START-->';
 const AUTO_RECENT_CHAT_SAFETY_BUFFER_TOKENS = 2000;
 
 const DEFAULT_GENERATION_PROMPT = `Ты скрытый сценарист roleplay-истории. Твоя задача — не писать следующий ответ персонажа, а обновить долгосрочный скрытый план истории.
@@ -90,10 +90,11 @@ const DEFAULT_SETTINGS = {
     injectionDepth: 4,
     generationPrompt: DEFAULT_GENERATION_PROMPT,
     includeWorldInfo: true,
-    applyRegexToPlannerRawBlock: false,
+    applyRegexToPlannerRawBlock: true,
     autoRecentChatCount: true,
     recentChatMessages: 30,
     maxGenerationLength: 1000,
+    connectionProfile: '',
 };
 
 const DEFAULT_STATE = {
@@ -117,6 +118,7 @@ const runtime = {
 
 let initialized = false;
 let lifecycleRegistered = false;
+let connectionProfilesActive;
 
 const saveMetadataDebounced = debounce(async () => await getContext().saveMetadata(), 1000);
 
@@ -182,6 +184,138 @@ function getPlanTextarea() {
 
 function getCurrentPlanText() {
     return getPlanTextarea()?.value ?? getChatState().currentPlan ?? '';
+}
+
+function checkConnectionProfilesActive() {
+    if (connectionProfilesActive === undefined) {
+        connectionProfilesActive = $('#sys-settings-button').find('#connection_profiles').length > 0;
+    }
+
+    return connectionProfilesActive;
+}
+
+async function getCurrentConnectionProfile() {
+    if (!checkConnectionProfilesActive()) {
+        return '';
+    }
+
+    try {
+        const context = getContext();
+        const result = await context.executeSlashCommandsWithOptions('/profile');
+        return String(result?.pipe ?? '').trim();
+    } catch (error) {
+        console.warn(`${MODULE_NAME}: /profile failed`, error);
+        return '';
+    }
+}
+
+async function getConnectionProfiles() {
+    if (!checkConnectionProfilesActive()) {
+        return [];
+    }
+
+    try {
+        const context = getContext();
+        const result = await context.executeSlashCommandsWithOptions('/profile-list');
+        const parsed = JSON.parse(String(result?.pipe ?? '[]'));
+        return Array.isArray(parsed) ? parsed.map(item => String(item)) : [];
+    } catch (error) {
+        console.warn(`${MODULE_NAME}: /profile-list failed`, error);
+        return [];
+    }
+}
+
+async function setConnectionProfile(name) {
+    if (!checkConnectionProfilesActive()) {
+        return;
+    }
+
+    const target = String(name ?? '').trim();
+
+    if (!target) {
+        return;
+    }
+
+    const current = await getCurrentConnectionProfile();
+
+    if (current === target) {
+        return;
+    }
+
+    const context = getContext();
+    await context.executeSlashCommandsWithOptions(`/profile ${target}`);
+}
+
+async function updateConnectionProfileDropdown() {
+    const row = document.getElementById('stsw-connection-profile-row');
+    const select = document.getElementById('stsw-connection-profile');
+
+    if (!(select instanceof HTMLSelectElement)) {
+        return;
+    }
+
+    if (!checkConnectionProfilesActive()) {
+        if (row instanceof HTMLElement) {
+            row.style.display = 'none';
+        }
+
+        return;
+    }
+
+    if (row instanceof HTMLElement) {
+        row.style.display = '';
+    }
+
+    const settings = getSettings();
+    const selected = String(settings.connectionProfile ?? '');
+    const profiles = await getConnectionProfiles();
+    const uniqueProfiles = [...new Set(profiles)];
+
+    select.innerHTML = '';
+
+    const defaultOption = document.createElement('option');
+    defaultOption.value = '';
+    defaultOption.textContent = 'Same as Current';
+    select.appendChild(defaultOption);
+
+    for (const profileName of uniqueProfiles) {
+        const option = document.createElement('option');
+        option.value = profileName;
+        option.textContent = profileName;
+        select.appendChild(option);
+    }
+
+    select.value = selected;
+    select.disabled = false;
+}
+
+async function runWithSelectedConnectionProfile(task) {
+    const settings = getSettings();
+    const desired = String(settings.connectionProfile ?? '').trim();
+
+    if (!desired || !checkConnectionProfilesActive()) {
+        return await task();
+    }
+
+    const current = await getCurrentConnectionProfile();
+    let switched = false;
+
+    try {
+        if (current !== desired) {
+            await setConnectionProfile(desired);
+            switched = true;
+        }
+
+        return await task();
+    } finally {
+        if (switched && current) {
+            try {
+                await setConnectionProfile(current);
+            } catch (error) {
+                console.error(`${MODULE_NAME}: failed to restore connection profile`, error);
+            }
+        }
+    }
 }
 
 function setCurrentPlanText(value) {
@@ -261,7 +395,8 @@ function isRoleplayAssistantMessage(message) {
         return false;
     }
 
-    return RP_STATUS_REGEX.test(String(message.mes ?? ''));
+    const rawText = String(message.mes ?? message.message ?? message.content ?? '');
+    return !rawText.includes(STCS_HIDDEN_BLOCK_MARKER);
 }
 
 function computeRpMetrics(chat, state) {
@@ -838,6 +973,7 @@ function fillFormFromState() {
     panel.querySelector('#stsw-injection-depth').value = settings.injectionDepth;
     panel.querySelector('#stsw-generation-prompt').value = settings.generationPrompt;
     panel.querySelector('#stsw-max-generation-length').value = settings.maxGenerationLength;
+    panel.querySelector('#stsw-connection-profile').value = String(settings.connectionProfile ?? '');
     panel.querySelector('#stsw-current-plan').value = state.currentPlan ?? '';
     updateRecentChatInputState();
     renderStatus();
@@ -928,12 +1064,14 @@ async function generatePlan(reason = 'manual') {
 
     try {
         const state = getChatState();
-        const prompt = await buildPlannerPrompt();
-        const plan = await generateQuietPrompt({
-            quietPrompt: prompt,
-            responseLength: settings.maxGenerationLength,
-            removeReasoning: true,
-            trimToSentence: false,
+        const plan = await runWithSelectedConnectionProfile(async () => {
+            const prompt = await buildPlannerPrompt();
+            return await generateQuietPrompt({
+                quietPrompt: prompt,
+                responseLength: settings.maxGenerationLength,
+                removeReasoning: true,
+                trimToSentence: false,
+            });
         });
 
         if (runtime.abortRequested) {
@@ -1096,6 +1234,16 @@ function bindEvents() {
         saveSettingsDebounced();
     });
 
+    panel.querySelector('#stsw-connection-profile').addEventListener('change', event => {
+        const settings = getSettings();
+        settings.connectionProfile = String(event.target.value ?? '');
+        saveSettingsDebounced();
+    });
+
+    panel.querySelector('#stsw-connection-profile').addEventListener('click', () => {
+        void updateConnectionProfileDropdown();
+    });
+
     panel.querySelector('#stsw-recent-chat-messages').addEventListener('input', event => {
         handleSettingNumber('recentChatMessages', event.target.value, 1, 200);
     });
@@ -1163,6 +1311,7 @@ function installApi() {
 async function refreshForChat() {
     await renderUI();
     bindEvents();
+    await updateConnectionProfileDropdown();
     fillFormFromState();
     updateInjection();
     await syncRpCounter({ triggerReplan: true });

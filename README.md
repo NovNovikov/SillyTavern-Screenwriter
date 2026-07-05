@@ -42,6 +42,7 @@ In this setup, the real working folder is:
 - `Include full World Info in plan generation`: when enabled, the extension injects the full currently resolved World Info into the hidden planner prompt.
 - `Apply regex to planner raw block`: applies SillyTavern regex processing to recent chat and status-block message text before sending that material to the planner.
 - `Automatic recent chat count`: when enabled, the extension calculates how much recent chat fits into the remaining token budget after subtracting the planner prompt and World Info.
+- `Connection profile for generation`: optionally switches to a selected Connection Manager profile only for the duration of hidden plan generation, then restores the previous profile.
 - `Recent chat messages to include`: how many recent non-system chat messages are copied into the planner prompt.
 - `Max generation length`: passed to SillyTavern's quiet generation helper.
 
