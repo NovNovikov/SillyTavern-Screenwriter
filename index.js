@@ -21,6 +21,10 @@ const STATE_KEY = MODULE_NAME;
 const CHECKPOINT_SUMMARIZE_METADATA_KEY = 'checkpoint_summarize';
 const STCS_HIDDEN_BLOCK_MARKER = '<!--STCS_START-->';
 const AUTO_RECENT_CHAT_SAFETY_BUFFER_TOKENS = 2000;
+const SPECIAL_EVENT_PREFIXES = [
+    { prefix: 'ЧЕРНЫЙ ЛЕБЕДЬ', type: 'black_swan', note: 'ЧЕРНЫЙ ЛЕБЕДЬ' },
+    { prefix: 'ПТИЦА СЧАСТЬЯ', type: 'bird_of_happiness', note: 'ПТИЦА СЧАСТЬЯ' },
+];
 const DEFAULT_CHECKPOINT_INJECTION_TEMPLATE = `[Checkpoint Memory]
 
 The following are manually reviewed checkpoint summaries of earlier chat history.
@@ -112,6 +116,7 @@ const DEFAULT_SETTINGS = {
 
 const DEFAULT_STATE = {
     currentPlan: '',
+    planHistory: [],
     rpMessagesSinceLastPlan: 0,
     lastPlannedMessageId: -1,
     lastPlanGeneratedAt: '',
@@ -132,6 +137,7 @@ const runtime = {
     pendingInitialPlanPromptKey: '',
     pendingInitialPlanPromptTimer: 0,
     promptRequestVersion: 0,
+    lastSpecialEventSignature: '',
 };
 
 let initialized = false;
@@ -181,8 +187,279 @@ function getRawChatState() {
     return stored && typeof stored === 'object' ? stored : {};
 }
 
+function getCurrentChatLastMessageId() {
+    const context = getContext();
+    const chat = Array.isArray(context?.chat) ? context.chat : [];
+    return chat.length > 0 ? chat.length - 1 : -1;
+}
+
+function sortPlanHistory(history) {
+    return [...history].sort((left, right) => {
+        if (left.startMessageId !== right.startMessageId) {
+            return left.startMessageId - right.startMessageId;
+        }
+
+        return String(left.generatedAt || '').localeCompare(String(right.generatedAt || ''));
+    });
+}
+
+function normalizePlanHistoryEntry(entry, index = 0) {
+    if (!entry || typeof entry !== 'object') {
+        return null;
+    }
+
+    const planText = String(entry.planText ?? entry.plan ?? '').trim();
+    const startMessageId = Number(entry.startMessageId ?? entry.lastPlannedMessageId ?? -1);
+
+    if (!planText || !Number.isInteger(startMessageId)) {
+        return null;
+    }
+
+    const endRaw = entry.endMessageId;
+    const normalizedEnd = endRaw === null || endRaw === undefined || endRaw === ''
+        ? null
+        : Number(endRaw);
+    const endMessageId = Number.isInteger(normalizedEnd) && normalizedEnd >= startMessageId
+        ? normalizedEnd
+        : null;
+    const generatedAt = String(entry.generatedAt ?? entry.lastPlanGeneratedAt ?? '').trim();
+    const reason = String(entry.reason ?? entry.sourceReason ?? '').trim();
+
+    return {
+        id: String(entry.id ?? `plan-${startMessageId}-${generatedAt || index}`),
+        planText,
+        startMessageId,
+        endMessageId,
+        generatedAt,
+        reason,
+    };
+}
+
+function normalizePlanHistory(history) {
+    if (!Array.isArray(history)) {
+        return [];
+    }
+
+    return sortPlanHistory(history
+        .map((entry, index) => normalizePlanHistoryEntry(entry, index))
+        .filter(Boolean));
+}
+
+function createPlanHistoryEntry({ planText, startMessageId, endMessageId = null, generatedAt = '', reason = '' } = {}) {
+    return normalizePlanHistoryEntry({
+        id: `plan-${startMessageId}-${generatedAt || Date.now()}`,
+        planText,
+        startMessageId,
+        endMessageId,
+        generatedAt,
+        reason,
+    });
+}
+
+function resolvePlanHistoryForCurrentChat(history, lastMessageId) {
+    const sortedHistory = normalizePlanHistory(history);
+
+    if (!sortedHistory.length) {
+        return { history: [], changed: false };
+    }
+
+    let changed = false;
+    let nextHistory = sortedHistory;
+    const trimmedHistory = sortedHistory.filter(entry => entry.startMessageId <= lastMessageId);
+
+    if (trimmedHistory.length !== sortedHistory.length) {
+        nextHistory = trimmedHistory.map(entry => ({ ...entry }));
+        changed = true;
+
+        if (nextHistory.length) {
+            const lastEntry = nextHistory[nextHistory.length - 1];
+
+            if (lastEntry.endMessageId !== null) {
+                lastEntry.endMessageId = null;
+            }
+        }
+    }
+
+    return {
+        history: normalizePlanHistory(nextHistory),
+        changed,
+    };
+}
+
+function getApplicablePlanHistoryEntry(history, lastMessageId) {
+    const normalizedHistory = normalizePlanHistory(history);
+
+    for (let index = normalizedHistory.length - 1; index >= 0; index--) {
+        const entry = normalizedHistory[index];
+        const startsBeforeOrAtChat = entry.startMessageId <= lastMessageId;
+        const endsAfterOrAtChat = entry.endMessageId === null || entry.endMessageId >= lastMessageId;
+
+        if (startsBeforeOrAtChat && endsAfterOrAtChat) {
+            return entry;
+        }
+    }
+
+    return null;
+}
+
+function getBaseChatState() {
+    const rawState = { ...DEFAULT_STATE, ...getRawChatState() };
+    const generatedAt = String(rawState.lastPlanGeneratedAt ?? '').trim();
+    const legacyPlan = String(rawState.currentPlan ?? '').trim();
+    const legacyStartMessageId = Number(rawState.lastPlannedMessageId);
+    let planHistory = normalizePlanHistory(rawState.planHistory);
+
+    if (!planHistory.length && legacyPlan) {
+        const fallbackStartMessageId = Number.isInteger(legacyStartMessageId)
+            ? legacyStartMessageId
+            : getCurrentChatLastMessageId();
+        const legacyEntry = createPlanHistoryEntry({
+            planText: legacyPlan,
+            startMessageId: fallbackStartMessageId,
+            generatedAt,
+            reason: 'legacy',
+        });
+
+        if (legacyEntry) {
+            planHistory = [legacyEntry];
+        }
+    }
+
+    return {
+        ...rawState,
+        currentPlan: legacyPlan,
+        lastPlanGeneratedAt: generatedAt,
+        lastPlannedMessageId: Number.isInteger(legacyStartMessageId) ? legacyStartMessageId : -1,
+        planHistory,
+    };
+}
+
 function getChatState() {
-    return { ...DEFAULT_STATE, ...getRawChatState() };
+    const baseState = getBaseChatState();
+    const lastMessageId = getCurrentChatLastMessageId();
+    const resolvedHistory = resolvePlanHistoryForCurrentChat(baseState.planHistory, lastMessageId).history;
+    const applicableEntry = getApplicablePlanHistoryEntry(resolvedHistory, lastMessageId);
+
+    if (!applicableEntry) {
+        return {
+            ...baseState,
+            planHistory: resolvedHistory,
+            currentPlan: '',
+            lastPlannedMessageId: -1,
+            lastPlanGeneratedAt: '',
+        };
+    }
+
+    return {
+        ...baseState,
+        planHistory: resolvedHistory,
+        currentPlan: applicableEntry.planText,
+        lastPlannedMessageId: applicableEntry.startMessageId,
+        lastPlanGeneratedAt: applicableEntry.generatedAt,
+    };
+}
+
+async function reconcilePlanStateForCurrentChat(persistMode = 'debounced') {
+    const context = getContext();
+    const metadata = getMetadataRoot();
+
+    if (!context || !metadata) {
+        return getChatState();
+    }
+
+    const baseState = getBaseChatState();
+    const lastMessageId = getCurrentChatLastMessageId();
+    const resolved = resolvePlanHistoryForCurrentChat(baseState.planHistory, lastMessageId);
+    const applicableEntry = getApplicablePlanHistoryEntry(resolved.history, lastMessageId);
+    const nextState = {
+        ...baseState,
+        planHistory: resolved.history,
+        currentPlan: applicableEntry?.planText ?? '',
+        lastPlannedMessageId: applicableEntry?.startMessageId ?? -1,
+        lastPlanGeneratedAt: applicableEntry?.generatedAt ?? '',
+    };
+    const stateChanged = resolved.changed
+        || nextState.currentPlan !== baseState.currentPlan
+        || nextState.lastPlannedMessageId !== baseState.lastPlannedMessageId
+        || nextState.lastPlanGeneratedAt !== baseState.lastPlanGeneratedAt
+        || JSON.stringify(nextState.planHistory) !== JSON.stringify(baseState.planHistory);
+
+    if (!stateChanged) {
+        return nextState;
+    }
+
+    metadata[STATE_KEY] = nextState;
+
+    if (persistMode === 'immediate') {
+        await context.saveMetadata();
+    } else if (persistMode === 'debounced') {
+        saveMetadataDebounced();
+    }
+
+    return nextState;
+}
+
+function updatePlanHistoryForPlan(state, planText, { startMessageId, generatedAt = '', reason = '' } = {}) {
+    const normalizedPlanText = String(planText ?? '').trim();
+    const normalizedStartMessageId = Number(startMessageId);
+
+    if (!normalizedPlanText || !Number.isInteger(normalizedStartMessageId)) {
+        return normalizePlanHistory(state?.planHistory);
+    }
+
+    let history = normalizePlanHistory(state?.planHistory)
+        .filter(entry => entry.startMessageId <= normalizedStartMessageId)
+        .map(entry => ({ ...entry }));
+    const sameStartIndex = history.findLastIndex(entry => entry.startMessageId === normalizedStartMessageId);
+
+    if (sameStartIndex >= 0) {
+        history = history.slice(0, sameStartIndex + 1);
+        history[sameStartIndex] = {
+            ...history[sameStartIndex],
+            planText: normalizedPlanText,
+            endMessageId: null,
+            generatedAt: String(generatedAt ?? '').trim(),
+            reason: String(reason ?? '').trim(),
+        };
+    } else {
+        if (history.length) {
+            history[history.length - 1].endMessageId = normalizedStartMessageId - 1;
+        }
+
+        const newEntry = createPlanHistoryEntry({
+            planText: normalizedPlanText,
+            startMessageId: normalizedStartMessageId,
+            generatedAt,
+            reason,
+        });
+
+        if (newEntry) {
+            history.push(newEntry);
+        }
+    }
+
+    return normalizePlanHistory(history);
+}
+
+function clearApplicablePlanFromHistory(state, lastMessageId) {
+    const history = normalizePlanHistory(state?.planHistory).map(entry => ({ ...entry }));
+    const applicableEntry = getApplicablePlanHistoryEntry(history, lastMessageId);
+
+    if (!applicableEntry) {
+        return history;
+    }
+
+    const nextHistory = history.filter(entry => entry.id !== applicableEntry.id);
+
+    if (nextHistory.length) {
+        const lastEntry = nextHistory[nextHistory.length - 1];
+
+        if (lastEntry.startMessageId <= lastMessageId && lastEntry.endMessageId !== null && lastEntry.endMessageId >= lastMessageId) {
+            lastEntry.endMessageId = null;
+        }
+    }
+
+    return normalizePlanHistory(nextHistory);
 }
 
 function writeChatState(patch, persistMode = 'debounced') {
@@ -253,6 +530,58 @@ function getCurrentPlanText() {
 
 function chatHasPlan(state = getChatState()) {
     return Boolean(String(getCurrentPlanText() ?? '').trim() || String(state?.currentPlan ?? '').trim());
+}
+
+function getRawMessageText(message) {
+    return String(message?.mes ?? message?.message ?? message?.content ?? '');
+}
+
+function detectSpecialPlannerEvent(message) {
+    if (!isRoleplayAssistantMessage(message) || hasHiddenStcsBlock(message)) {
+        return null;
+    }
+
+    const rawText = getRawMessageText(message).trimStart();
+
+    for (const candidate of SPECIAL_EVENT_PREFIXES) {
+        if (rawText.startsWith(candidate.prefix)) {
+            return candidate;
+        }
+    }
+
+    return null;
+}
+
+async function maybeTriggerSpecialEventReplan(source = 'message') {
+    const context = getContext();
+    const chat = Array.isArray(context.chat) ? context.chat : [];
+
+    if (!chat.length || !getSettings().enabled) {
+        return false;
+    }
+
+    const messageIndex = chat.length - 1;
+    const message = chat[messageIndex];
+    const detectedEvent = detectSpecialPlannerEvent(message);
+
+    if (!detectedEvent) {
+        return false;
+    }
+
+    const chatKey = getActiveChatKey();
+    const signature = `${chatKey}:${messageIndex}:${detectedEvent.type}`;
+
+    if (runtime.lastSpecialEventSignature === signature) {
+        return false;
+    }
+
+    runtime.lastSpecialEventSignature = signature;
+    await setPendingEvent({
+        type: detectedEvent.type,
+        note: detectedEvent.note,
+        source: `message:${source}`,
+    }, true);
+    return true;
 }
 
 function clearPendingInitialPlanPrompt() {
@@ -1173,16 +1502,38 @@ function fillFormFromState() {
 }
 
 async function savePlanFromEditor() {
+    const state = getChatState();
     const planText = getCurrentPlanText();
-    await writeChatState({ currentPlan: planText }, 'immediate');
+    const lastMessageId = getCurrentChatLastMessageId();
+    const generatedAt = state.lastPlanGeneratedAt || new Date().toISOString();
+    const planHistory = updatePlanHistoryForPlan(state, planText, {
+        startMessageId: Math.max(-1, lastMessageId),
+        generatedAt,
+        reason: 'manual_edit',
+    });
+
+    await writeChatState({
+        currentPlan: String(planText ?? '').trim(),
+        planHistory,
+        lastPlannedMessageId: Math.max(-1, lastMessageId),
+        lastPlanGeneratedAt: generatedAt,
+    }, 'immediate');
     updateInjection();
     renderStatus();
     toastr.success('Screenwriter plan saved');
 }
 
 async function clearPlan() {
+    const state = getChatState();
+    const lastMessageId = getCurrentChatLastMessageId();
+    const planHistory = clearApplicablePlanFromHistory(state, lastMessageId);
     setCurrentPlanText('');
-    await writeChatState({ currentPlan: '' }, 'immediate');
+    await writeChatState({
+        currentPlan: '',
+        planHistory,
+        lastPlannedMessageId: -1,
+        lastPlanGeneratedAt: '',
+    }, 'immediate');
     updateInjection();
     renderStatus();
     toastr.info('Screenwriter plan cleared');
@@ -1287,11 +1638,19 @@ async function generatePlan(reason = 'manual') {
         }
 
         const lastMessageId = Array.isArray(context.chat) && context.chat.length > 0 ? context.chat.length - 1 : -1;
+        const generatedAt = new Date().toISOString();
+        const planText = String(plan).trim();
+        const planHistory = updatePlanHistoryForPlan(state, planText, {
+            startMessageId: lastMessageId,
+            generatedAt,
+            reason,
+        });
         const nextState = {
-            currentPlan: String(plan).trim(),
+            currentPlan: planText,
+            planHistory,
             rpMessagesSinceLastPlan: 0,
             lastPlannedMessageId: lastMessageId,
-            lastPlanGeneratedAt: new Date().toISOString(),
+            lastPlanGeneratedAt: generatedAt,
             pendingEvent: false,
             pendingEventType: '',
             pendingEventNote: '',
@@ -1519,8 +1878,21 @@ function installApi() {
         getPlan: () => getCurrentPlanText() || getChatState().currentPlan || '',
         setPlan: async text => {
             const value = String(text ?? '');
+            const state = getChatState();
+            const lastMessageId = getCurrentChatLastMessageId();
+            const generatedAt = state.lastPlanGeneratedAt || new Date().toISOString();
+            const planHistory = updatePlanHistoryForPlan(state, value, {
+                startMessageId: Math.max(-1, lastMessageId),
+                generatedAt,
+                reason: 'api_set',
+            });
             setCurrentPlanText(value);
-            await writeChatState({ currentPlan: value }, 'immediate');
+            await writeChatState({
+                currentPlan: value,
+                planHistory,
+                lastPlannedMessageId: Math.max(-1, lastMessageId),
+                lastPlanGeneratedAt: generatedAt,
+            }, 'immediate');
             updateInjection();
             renderStatus();
             return value;
@@ -1537,14 +1909,17 @@ async function refreshForChat({ allowPrompt = false, triggerReplan = true } = {}
 
     if (!currentChatKey) {
         runtime.pendingInitialPlanPromptKey = '';
+        runtime.lastSpecialEventSignature = '';
         clearPendingInitialPlanPrompt();
     } else if (isChatEntry) {
         runtime.pendingInitialPlanPromptKey = currentChatKey;
+        runtime.lastSpecialEventSignature = '';
         clearPendingInitialPlanPrompt();
     }
 
     runtime.lastSeenChatKey = currentChatKey;
 
+    await reconcilePlanStateForCurrentChat('debounced');
     await renderUI();
     bindEvents();
     await updateConnectionProfileDropdown();
@@ -1575,9 +1950,18 @@ function registerLifecycle() {
     eventSource.on(event_types.APP_READY, async () => await refreshForChat({ allowPrompt: false, triggerReplan: false }));
     eventSource.on(event_types.CHAT_CHANGED, async () => await refreshForChat({ allowPrompt: false, triggerReplan: false }));
     eventSource.on(event_types.CHAT_LOADED, async () => await refreshForChat({ allowPrompt: true, triggerReplan: true }));
-    eventSource.on(event_types.MESSAGE_RECEIVED, async () => await syncRpCounter({ triggerReplan: true }));
-    eventSource.on(event_types.MESSAGE_SWIPED, async () => await syncRpCounter({ triggerReplan: true }));
-    eventSource.on(event_types.MESSAGE_EDITED, async () => await syncRpCounter({ triggerReplan: true }));
+    eventSource.on(event_types.MESSAGE_RECEIVED, async () => {
+        await maybeTriggerSpecialEventReplan('received');
+        await syncRpCounter({ triggerReplan: true });
+    });
+    eventSource.on(event_types.MESSAGE_SWIPED, async () => {
+        await maybeTriggerSpecialEventReplan('swiped');
+        await syncRpCounter({ triggerReplan: true });
+    });
+    eventSource.on(event_types.MESSAGE_EDITED, async () => {
+        await maybeTriggerSpecialEventReplan('edited');
+        await syncRpCounter({ triggerReplan: true });
+    });
     eventSource.on(event_types.MESSAGE_DELETED, async () => await syncRpCounter({ triggerReplan: false }));
     eventSource.on(event_types.GENERATION_STOPPED, () => {
         if (runtime.isGenerating) {
